@@ -1,31 +1,31 @@
-import matplotlib.pyplot as plt
 import torch
 import cv2
-import math
 from torchvision import transforms
 import numpy as np
 import os
-
 from tqdm import tqdm
+
+from audio_algorithm import fall_detection_by_audio
+from audio_algorithm.transform_video_and_audio import add_audio_to_video, extract_audio
+from models import fall_detection_by_cv
 
 from utils.datasets import letterbox
 from utils.general import non_max_suppression_kpt
-from utils.plots import output_to_keypoint, plot_skeleton_kpts
+from utils.plots import output_to_keypoint
 
 
-def get_frame_indices(vid_cap, time_scales=((0, 1), (1.5, 2))):
+def get_frame_indices(vid_cap, time_scales):
     target_frames = []
 
-    # 获取视频的总帧数
     frame_count = int(vid_cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # 获取视频的帧率
     fps = vid_cap.get(cv2.CAP_PROP_FPS)
 
     if fps == 0:
         print("Error: Frame rate is zero, which is invalid.")
         return []
-
+    if time_scales is None:
+        return set()
     for time_scale in time_scales:
         start_frame = int(fps * time_scale[0])
         end_frame = int(fps * time_scale[1])
@@ -34,52 +34,28 @@ def get_frame_indices(vid_cap, time_scales=((0, 1), (1.5, 2))):
         else:
             print(f"Warning: Time scale {time_scale} is out of video frame range.")
 
-    return target_frames
+    return set(item for sublist in target_frames for item in sublist)
 
 
 def falling_alarm_by_audio(image):
     height, width = image.shape[:2]
-    thickness = min(height, width) * 0.15  # 设置边框的厚度，可以根据需要调整
-
-    # 创建一个与原图像同样大小的全零矩阵（黑色图像）
-    overlay = np.zeros_like(image)
-
-    # 设置渐变色
-    for i in range(thickness):
-        # 计算当前边框颜色的透明度，从完全不透明到透明
-        alpha = 1 - (i / thickness)
-        color = (0, 0, 255)  # 红色
-        cv2.rectangle(overlay, (i, i), (width - i, height - i), color, 1)
-
-    # 将渐变层与原图像合并
-    cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
-
-    return image
+    thickness = int(min(height, width) * 0.06)  
 
 
-def fall_detection(poses):
-    for pose in poses:
-        xmin, ymin = (pose[2] - pose[4] / 2), (pose[3] - pose[5] / 2)
-        xmax, ymax = (pose[2] + pose[4] / 2), (pose[3] + pose[5] / 2)
-        left_shoulder_y = pose[23]
-        left_shoulder_x = pose[22]
-        right_shoulder_y = pose[26]
-        left_body_y = pose[41]
-        left_body_x = pose[40]
-        right_body_y = pose[44]
-        len_factor = math.sqrt(((left_shoulder_y - left_body_y) ** 2 + (left_shoulder_x - left_body_x) ** 2))
-        left_foot_y = pose[53]
-        right_foot_y = pose[56]
-        dx = int(xmax) - int(xmin)
-        dy = int(ymax) - int(ymin)
-        difference = dy - dx
-        if left_shoulder_y > left_foot_y - len_factor and left_body_y > left_foot_y - (
-                len_factor / 2) and left_shoulder_y > left_body_y - (len_factor / 2) or (
-                right_shoulder_y > right_foot_y - len_factor and right_body_y > right_foot_y - (
-                len_factor / 2) and right_shoulder_y > right_body_y - (len_factor / 2)) \
-                or difference < 0:
-            return True, (xmin, ymin, xmax, ymax)
-    return False, None
+    overlay = image.copy()
+
+    cv2.rectangle(overlay, (0, 0), (width, height), (0, 0, 255), thickness)
+
+
+    text = "Fall detected by audio algorithm!"
+    font_scale = 1.0
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    text_size = cv2.getTextSize(text, font, font_scale, 2)[0]
+    text_x = (width - text_size[0]) // 2
+    text_y = height - int(height * 0.1)  
+    cv2.putText(overlay, text, (text_x, text_y), font, font_scale, (0, 0, 255), 2)
+
+    return overlay  
 
 
 def falling_alarm(image, bbox):
@@ -118,46 +94,75 @@ def get_pose(image, model, device):
 def prepare_image(image):
     _image = image[0].permute(1, 2, 0) * 255
     _image = _image.cpu().numpy().astype(np.uint8)
-    _image = cv2.cvtColor(_image, None)
+    _image = cv2.cvtColor(_image, cv2.COLOR_RGB2BGR)
     return _image
 
 
-def prepare_vid_out(video_path, vid_cap):
+def prepare_vid_out(directory, vid_cap, filename_with_suffix):
     vid_write_image = letterbox(vid_cap.read()[1], 960, stride=64, auto=True)[0]
+
     resize_height, resize_width = vid_write_image.shape[:2]
-    out_video_name = f"{video_path.split('/')[-1].split('.')[0]}_keypoint.mp4"
-    out = cv2.VideoWriter(out_video_name, cv2.VideoWriter_fourcc(*'mp4v'), 60, (resize_width, resize_height),True)
-    return out
+
+    out_video_name = f"{filename_with_suffix.split('.')[0]}_keypoint.mp4"
+    out_path = os.path.join(directory, out_video_name)
+
+    out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), vid_cap.get(cv2.CAP_PROP_FPS), (resize_width, resize_height), True)
+    if not out.isOpened():
+        print(f"Error: Cannot create video writer for {out_path}. Check codec support and path.")
+
+    return out, out_path
 
 
-def process_video(video_path):
-    vid_cap = cv2.VideoCapture(video_path)
+def process_video(read_directory: str, write_directory: str, temp_directory: str, filename_with_suffix: str):
+    current_video_path = os.path.join(read_directory, filename_with_suffix)
+    output_path = os.path.join(write_directory, f"[Processed]{filename_with_suffix}")
+
+    print(f"Processing video: {current_video_path}")
+
+    vid_cap = cv2.VideoCapture(current_video_path)
+    vid_out, temp_video_path = prepare_vid_out(temp_directory, vid_cap, filename_with_suffix)
 
     if not vid_cap.isOpened():
-        print('Error while trying to read video. Please check path again')
+        print(f"Error: Failed to open video {current_video_path}")
         return
 
+    # get pose estimation model
     model, device = get_pose_model()
-    vid_out = prepare_vid_out(video_path, vid_cap)
 
+    # make a list of original frames
+    frames = []
     success, frame = vid_cap.read()
-    _frames = []
+    if not success:
+        print("Error: Failed to read the first frame.")
     while success:
-        _frames.append(frame)
+        frames.append(frame)
         success, frame = vid_cap.read()
 
-    for index, image in enumerate(tqdm(_frames)):
-        image, output = get_pose(image, model, device)
+    # extract audio from video
+    audio_save_directory = "data/temp/audio"
+    if not os.path.exists(audio_save_directory):
+        os.makedirs(audio_save_directory)
+    audio_path = os.path.join(audio_save_directory, f"{filename_with_suffix.split('.')[0]}_audio.wav")
+    extract_audio(current_video_path, audio_path)
+
+    # get a set of frames that detected by audio algorithm
+    time_scale = fall_detection_by_audio(audio_path, "fall_detection_model_by_audio.pth")
+    target_frame_indices = get_frame_indices(vid_cap, time_scale)
+
+    for index, image in enumerate(tqdm(frames)):
+        image, output = get_pose(image, model, device)  # get current pose with pose model in current frame
         _image = prepare_image(image)
-        is_fall, bbox = fall_detection(output)
+        is_fall, bbox = fall_detection_by_cv(output)  # test current pose with model
         if is_fall:
             falling_alarm(_image, bbox)
-        if index in get_frame_indices(vid_cap):
-            falling_alarm_by_audio(_image)
+        if index in target_frame_indices:
+            _image = falling_alarm_by_audio(_image)
         vid_out.write(_image)
 
     vid_out.release()
     vid_cap.release()
+
+    add_audio_to_video(temp_video_path, audio_path, output_path)
 
 
 def real_time_fall_detection():
@@ -177,16 +182,16 @@ def real_time_fall_detection():
                 break  # If the frame is not successfully read, break out of the loop
 
             # Process the frame for pose detection and fall detection
-            image, output = get_pose(frame, model, device)
-            _image = prepare_image(image)
+            # image, output = get_pose(frame, model, device)
+            # _image = prepare_image(image)
 
-            is_fall, bbox = fall_detection(output)
-
-            if is_fall:
-                falling_alarm(_image, bbox)
+            # is_fall, bbox = fall_detection(output)
+            #
+            # if is_fall:
+            #     falling_alarm(_image, bbox)
             l_image = frame
 
-            cv2.imshow("Fall Detection", _image)
+            # cv2.imshow("Fall Detection", _image)
             cv2.imshow("Camera View", l_image)
 
             # Break the loop if 'q' is pressed
@@ -198,8 +203,27 @@ def real_time_fall_detection():
 
 
 if __name__ == '__main__':
-    # videos_path = 'fall_dataset/videos'
-    # for video in os.listdir(videos_path):
-    #     video_path = os.path.join(videos_path, video)
-    #     process_video(video_path)
-    real_time_fall_detection()
+    # real_time_fall_detection()
+
+    directory_in = 'data/input/videos'
+    directory_out = "data/output/videos"
+    directory_temp = 'data/temp/videos'
+    if not os.path.exists(directory_in):
+        os.makedirs(directory_in)
+    if not os.path.exists(directory_out):
+        os.makedirs(directory_out)
+    if not os.path.exists(directory_temp):
+        os.makedirs(directory_temp)
+    print(f"Available videos in {directory_in}:")
+    for filename in os.listdir(directory_in):
+        print(filename)
+    print("---------------------------------------------")
+
+    for filename in os.listdir(directory_in):
+        file_in_path = os.path.join(directory_in, filename)
+        if os.path.isfile(file_in_path):
+            process_video(directory_in, directory_out, directory_temp, filename)
+        else:
+            print(f"{file_in_path} is not a file")
+
+
